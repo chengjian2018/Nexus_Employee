@@ -1,0 +1,367 @@
+import { nextTick, reactive, ref, type Ref } from "vue";
+import { message } from "@openvort/vort-ui";
+import {
+    addVortflowIterationStory, addVortflowIterationTask, addVortflowIterationBug,
+    removeVortflowIterationStory, removeVortflowIterationTask, removeVortflowIterationBug,
+} from "@/api";
+import type { RowItem } from "@/components/vort-biz/work-item/WorkItemTable.types";
+import { resolveBugIterationPlanTime } from "../work-item/iterationPlanTime";
+
+export interface UseWorkItemFieldEditorsOptions {
+    syncRecordUpdateToApi: (record: RowItem, patch: any) => Promise<void>;
+    getInteractiveCellKey: (record: RowItem) => string;
+    isCellBackgroundClick: (event: Event) => boolean;
+    openCellPickerOnBackgroundClick: (record: RowItem, event: Event, openMap: Record<string, boolean>) => void;
+    normalizeDateValue: (value: unknown) => string;
+    apiProjects: Ref<Array<{ id: string; name: string }>>;
+    apiIterations: Ref<Array<{ id: string; name: string; start_date?: unknown; end_date?: unknown }>>;
+    /** 已打开过计划时间编辑器的行缓存；迭代联动时需要同步，避免显示旧日期。 */
+    planTimeModel: Record<string, any>;
+    // Fallback iteration map collected from current table rows. Used when
+    // apiIterations is paginated/scoped and does not contain the row's iteration
+    // (e.g. cross-project work wall). Aligns with iteration filter data source.
+    dynamicIterationOptions?: Ref<Array<{ id: string; name: string; start_date?: unknown; end_date?: unknown }>>;
+    getRepoNameById: (repoId?: string) => string;
+    loadRepoOptions: () => Promise<void>;
+    loadBranchOptions: (repoId?: string) => Promise<void>;
+}
+
+export function useWorkItemFieldEditors(options: UseWorkItemFieldEditorsOptions) {
+    const {
+        syncRecordUpdateToApi,
+        getInteractiveCellKey,
+        isCellBackgroundClick,
+        openCellPickerOnBackgroundClick,
+        normalizeDateValue,
+        apiProjects,
+        apiIterations,
+        planTimeModel,
+        dynamicIterationOptions,
+        getRepoNameById,
+        loadRepoOptions,
+        loadBranchOptions,
+    } = options;
+
+    // --- Estimate hours ---
+    const estimateEditingFor = ref<string | null>(null);
+    const estimateDraftMap = reactive<Record<string, number | null>>({});
+    const estimateInputRef = ref<any>(null);
+
+    const openEstimateEditor = (record: RowItem) => {
+        const key = getInteractiveCellKey(record);
+        estimateDraftMap[key] = record.estimateHours == null || record.estimateHours === ""
+            ? null
+            : Number(record.estimateHours);
+        estimateEditingFor.value = key;
+        nextTick(() => estimateInputRef.value?.focus());
+    };
+
+    const selectRowEstimateHours = async (record: RowItem, value?: number | null) => {
+        const key = getInteractiveCellKey(record);
+        const prevEstimate = record.estimateHours;
+        const prevRemain = record.remainHours;
+        const nextValue = value == null || value === undefined ? undefined : Number(value);
+        record.estimateHours = nextValue;
+        if (record.loggedHours != null && nextValue != null) {
+            record.remainHours = Math.max(0, Number(nextValue) - Number(record.loggedHours || 0));
+        } else if (nextValue == null) {
+            record.remainHours = undefined;
+        }
+        estimateEditingFor.value = null;
+        try {
+            await syncRecordUpdateToApi(record, { estimate_hours: nextValue });
+        } catch (error: any) {
+            record.estimateHours = prevEstimate;
+            record.remainHours = prevRemain;
+            estimateDraftMap[key] = prevEstimate == null ? null : Number(prevEstimate);
+            message.error(error?.message || "预估工时同步失败");
+        }
+    };
+
+    // --- Progress ---
+    const progressEditingFor = ref<string | null>(null);
+    const progressDraftMap = reactive<Record<string, number | null>>({});
+    const progressInputRef = ref<any>(null);
+
+    const isProgressReadonly = (record: RowItem) => {
+        if (record.type === "需求") return false;
+        if ((record.childrenCount || 0) > 0) return true;
+        return false;
+    };
+
+    const openProgressEditor = (record: RowItem) => {
+        if (isProgressReadonly(record)) return;
+        const key = getInteractiveCellKey(record);
+        progressDraftMap[key] = record.progress ?? 0;
+        progressEditingFor.value = key;
+        nextTick(() => progressInputRef.value?.focus());
+    };
+
+    const selectRowProgress = async (record: RowItem, value?: number | null) => {
+        const key = getInteractiveCellKey(record);
+        const prevProgress = record.progress;
+        const nextValue = value == null ? 0 : Math.max(0, Math.min(100, Math.round(Number(value))));
+        record.progress = nextValue;
+        progressEditingFor.value = null;
+        try {
+            await syncRecordUpdateToApi(record, { progress: nextValue });
+        } catch (error: any) {
+            record.progress = prevProgress;
+            progressDraftMap[key] = prevProgress ?? 0;
+            message.error(error?.message || "进度同步失败");
+        }
+    };
+
+    // --- Project ---
+    const projectPickerOpenMap = reactive<Record<string, boolean>>({});
+
+    const selectRowProject = async (record: RowItem, projectId?: string) => {
+        const key = getInteractiveCellKey(record);
+        const prevProjectId = record.projectId || "";
+        const prevProjectName = record.projectName || "";
+        const nextProjectId = String(projectId || "");
+        const nextProjectName = apiProjects.value.find(p => p.id === nextProjectId)?.name || "";
+        record.projectId = nextProjectId;
+        record.projectName = nextProjectName;
+        projectPickerOpenMap[key] = false;
+        try {
+            await syncRecordUpdateToApi(record, { project_id: nextProjectId || null });
+        } catch (error: any) {
+            record.projectId = prevProjectId;
+            record.projectName = prevProjectName;
+            message.error(error?.message || "项目同步失败");
+        }
+    };
+
+    // --- Iteration ---
+    const selectRowIteration = async (record: RowItem, iterationId?: string, option?: any) => {
+        const itemId = String(record.backendId || "").trim();
+        if (!itemId) return;
+        const workNo = getInteractiveCellKey(record);
+        const prevIterationId = record.iterationId || "";
+        const prevIteration = record.iteration || "";
+        const prevPlanStart = record.planTime?.[0] || "";
+        const prevPlanEnd = record.planTime?.[1] || "";
+        const hasCachedPlanTime = Object.prototype.hasOwnProperty.call(planTimeModel, workNo);
+        const prevCachedPlanTime = hasCachedPlanTime && Array.isArray(planTimeModel[workNo])
+            ? [...planTimeModel[workNo]]
+            : undefined;
+        const nextIterationId = String(iterationId || "");
+        const optionName = typeof option?.label === "string"
+            ? option.label
+            : (typeof option?.name === "string" ? option.name : "");
+        // Multi-source name lookup: apiIterations 只包含当前已加载的懒分页范围；
+        // 跨项目工作墙上的迭代也可能只存在于当前页收集的 dynamicIterationOptions。
+        // 先回退到后者，避免找不到名称时把 iteration_name 清空。
+        const nextIteration = nextIterationId
+            ? (apiIterations.value.find(i => i.id === nextIterationId)?.name
+                || dynamicIterationOptions?.value.find(i => i.id === nextIterationId)?.name
+                || optionName
+                || (nextIterationId === prevIterationId ? prevIteration : ""))
+            : "";
+        record.iterationId = nextIterationId;
+        record.iteration = nextIteration;
+        record._prevIteration = nextIterationId;
+        const iterationPlanTime = resolveBugIterationPlanTime(
+            record.type,
+            nextIterationId,
+            [
+                ...apiIterations.value,
+                ...(dynamicIterationOptions?.value || []),
+            ],
+        );
+        if (iterationPlanTime) {
+            record.planTime = [...iterationPlanTime];
+            record.planStartDate = iterationPlanTime[0];
+            record.planEndDate = iterationPlanTime[1];
+            if (hasCachedPlanTime) {
+                planTimeModel[workNo] = [...iterationPlanTime];
+            }
+        }
+        try {
+            if (prevIterationId && prevIterationId !== nextIterationId) {
+                if (record.type === "需求") await removeVortflowIterationStory(prevIterationId, itemId);
+                else if (record.type === "任务") await removeVortflowIterationTask(prevIterationId, itemId);
+                else if (record.type === "缺陷") await removeVortflowIterationBug(prevIterationId, itemId);
+            }
+            if (nextIterationId && nextIterationId !== prevIterationId) {
+                if (record.type === "需求") await addVortflowIterationStory(nextIterationId, { story_id: itemId });
+                else if (record.type === "任务") await addVortflowIterationTask(nextIterationId, { task_id: itemId });
+                else if (record.type === "缺陷") await addVortflowIterationBug(nextIterationId, { bug_id: itemId });
+            }
+            if (iterationPlanTime && (prevPlanStart !== iterationPlanTime[0] || prevPlanEnd !== iterationPlanTime[1])) {
+                await syncRecordUpdateToApi(record, {
+                    plan_start: iterationPlanTime[0],
+                    deadline: iterationPlanTime[1],
+                });
+            }
+        } catch (error: any) {
+            record.iterationId = prevIterationId;
+            record.iteration = prevIteration;
+            record._prevIteration = prevIterationId;
+            record.planTime = [prevPlanStart, prevPlanEnd];
+            record.planStartDate = prevPlanStart;
+            record.planEndDate = prevPlanEnd;
+            if (hasCachedPlanTime) {
+                planTimeModel[workNo] = prevCachedPlanTime || [];
+            } else {
+                delete planTimeModel[workNo];
+            }
+            message.error(error?.message || "迭代同步失败");
+        }
+    };
+
+    // --- Repo ---
+    const repoPickerOpenMap = reactive<Record<string, boolean>>({});
+
+    const openRepoPicker = async (record: RowItem, event: Event) => {
+        const shouldOpen = isCellBackgroundClick(event);
+        openCellPickerOnBackgroundClick(record, event, repoPickerOpenMap);
+        if (shouldOpen) {
+            await loadRepoOptions();
+        }
+    };
+
+    const selectRowRepo = async (record: RowItem, repoId?: string) => {
+        const prevRepoId = record.repoId || "";
+        const prevRepo = record.repo || "";
+        const prevBranch = record.branch || "";
+        const nextRepoId = String(repoId || "");
+        const nextRepo = getRepoNameById(nextRepoId);
+        record.repoId = nextRepoId;
+        record.repo = nextRepo;
+        if (prevRepoId !== nextRepoId) {
+            record.branch = "";
+        }
+        repoPickerOpenMap[getInteractiveCellKey(record)] = false;
+        try {
+            await syncRecordUpdateToApi(record, {
+                repo_id: nextRepoId || null,
+                branch: prevRepoId !== nextRepoId ? "" : record.branch || "",
+            });
+            if (nextRepoId) {
+                await loadBranchOptions(nextRepoId);
+            }
+        } catch (error: any) {
+            record.repoId = prevRepoId;
+            record.repo = prevRepo;
+            record.branch = prevBranch;
+            message.error(error?.message || "关联仓库同步失败");
+        }
+    };
+
+    // --- Branch ---
+    const branchPickerOpenMap = reactive<Record<string, boolean>>({});
+
+    const openBranchPicker = async (record: RowItem, event: Event) => {
+        if (!record.repoId) {
+            message.warning("请先选择关联仓库");
+            return;
+        }
+        const shouldOpen = isCellBackgroundClick(event);
+        openCellPickerOnBackgroundClick(record, event, branchPickerOpenMap);
+        if (shouldOpen) {
+            await loadBranchOptions(record.repoId);
+        }
+    };
+
+    const selectRowBranch = async (record: RowItem, branch?: string) => {
+        const prevBranch = record.branch || "";
+        const nextBranch = String(branch || "");
+        record.branch = nextBranch;
+        branchPickerOpenMap[getInteractiveCellKey(record)] = false;
+        try {
+            await syncRecordUpdateToApi(record, { branch: nextBranch });
+        } catch (error: any) {
+            record.branch = prevBranch;
+            message.error(error?.message || "关联分支同步失败");
+        }
+    };
+
+    // --- Date fields (startAt / endAt / testTime / releaseTime) ---
+    const openDateFieldFor = ref<string | null>(null);
+    const dateFieldPickerOpen = ref(false);
+
+    const dateFieldApiKeyMap: Record<string, string> = {
+        startAt: "start_at",
+        endAt: "end_at",
+        testTime: "test_time",
+        draftTime: "draft_time",
+        releaseTime: "release_time",
+    };
+
+    const dateFieldLabelMap: Record<string, string> = {
+        startAt: "实际开始时间",
+        endAt: "实际结束时间",
+        testTime: "提测时间",
+        draftTime: "出稿时间",
+        releaseTime: "发布时间",
+    };
+
+    const toggleDateFieldPicker = (record: RowItem, field: string) => {
+        const key = getInteractiveCellKey(record);
+        const cellId = `${key}:${field}`;
+        const willOpen = openDateFieldFor.value !== cellId;
+        if (willOpen) {
+            dateFieldPickerOpen.value = false;
+            openDateFieldFor.value = cellId;
+            nextTick(() => {
+                dateFieldPickerOpen.value = true;
+            });
+        } else {
+            dateFieldPickerOpen.value = false;
+            openDateFieldFor.value = null;
+        }
+    };
+
+    const onDateFieldPickerOpenChange = (_record: RowItem, _field: string, open: boolean) => {
+        if (!open && openDateFieldFor.value) {
+            dateFieldPickerOpen.value = false;
+            openDateFieldFor.value = null;
+        }
+    };
+
+    const selectRowDateField = async (record: RowItem, field: "startAt" | "endAt" | "testTime" | "draftTime" | "releaseTime", value?: string) => {
+        const prev = record[field] || "";
+        const next = normalizeDateValue(value || "");
+        record[field] = next;
+        dateFieldPickerOpen.value = false;
+        openDateFieldFor.value = null;
+        try {
+            await syncRecordUpdateToApi(record, {
+                [dateFieldApiKeyMap[field]]: next || "",
+            });
+        } catch (error: any) {
+            record[field] = prev;
+            message.error(error?.message || `${dateFieldLabelMap[field]}同步失败`);
+        }
+    };
+
+    return {
+        estimateEditingFor,
+        estimateDraftMap,
+        estimateInputRef,
+        openEstimateEditor,
+        selectRowEstimateHours,
+        progressEditingFor,
+        progressDraftMap,
+        progressInputRef,
+        isProgressReadonly,
+        openProgressEditor,
+        selectRowProgress,
+        projectPickerOpenMap,
+        selectRowProject,
+        selectRowIteration,
+        repoPickerOpenMap,
+        openRepoPicker,
+        selectRowRepo,
+        branchPickerOpenMap,
+        openBranchPicker,
+        selectRowBranch,
+        openDateFieldFor,
+        dateFieldPickerOpen,
+        toggleDateFieldPicker,
+        onDateFieldPickerOpenChange,
+        selectRowDateField,
+    };
+}

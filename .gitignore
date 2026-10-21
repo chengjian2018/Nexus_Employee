@@ -1,0 +1,77 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# .cursor 目录：规则和 skills 提交到 Gitee 供团队共享，敏感文件单独排除
+.cursor/skills/openvort-release/
+.cursor/skills/openvort-infra-memo/
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# 部署脚本
+deploy.sh
+
+# 数据库
+*.db
+*.sqlite
+
+# Logs
+*.log
+/logs/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Certificates & keys
+*.pem
+*.key
+
+# Temp files
+*.bak
+*.tmp
+
+# Test
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Ruff
+.ruff_cache/
+
+# mypy
+.mypy_cache/
+
+# Web frontend
+web/node_modules/
+web/dist/
+
+# Docs (internal)
+docs/
+
+# Root-level test scripts
+/test_*.py
+
+# ZCode session data
+.zcode/
+# 本机部署覆盖(含内网代理地址),勿提交
+docker-compose.override.yml

@@ -1,0 +1,1248 @@
+"""Service commands: start, stop, restart."""
+
+import os
+import shutil
+import socket
+import sys
+from pathlib import Path
+from urllib.parse import urlparse
+
+import click
+
+from openvort import __version__
+from openvort.cli import (
+    PID_FILE,
+    _check_and_kill_existing,
+    _cleanup_pid,
+    _graceful_kill,
+    _is_process_alive,
+    _run_async,
+)
+
+DOCKER_PG_CONTAINER = "openvort-postgres"
+DOCKER_PG_IMAGE = "pgvector/pgvector:pg17"
+DOCKER_PG_VOLUME = "openvort-pgdata"
+
+
+def _project_root() -> Path:
+    """Locate the project root containing alembic.ini.
+
+    pyproject.toml 与 alembic.ini 都在仓库根目录;通过 src/openvort/cli/service.py 上溯 4 级。
+    """
+    return Path(__file__).resolve().parents[3]
+
+
+async def _run_alembic_upgrade(database_url: str, log) -> None:
+    """启动期执行 alembic upgrade head,把 schema 推到最新版本。
+
+    设计:
+    - 使用 subprocess 调用 alembic CLI(env.py 内部 asyncio.run,与本协程不冲突)。
+    - 仅当仓库根目录存在 alembic.ini 时执行;在 docker 部署等无源码场景静默跳过。
+    - 失败时打印错误并 SystemExit,避免 schema 不一致导致后续业务异常。
+    """
+    import asyncio
+
+    root = _project_root()
+    alembic_ini = root / "alembic.ini"
+    if not alembic_ini.exists():
+        return
+
+    env = os.environ.copy()
+    env["OPENVORT_DATABASE_URL"] = database_url
+
+    # 用当前 python 解释器调用 alembic,避免依赖 PATH 中的 alembic 可执行文件
+    proc = await asyncio.create_subprocess_exec(
+        sys.executable, "-m", "alembic", "upgrade", "head",
+        cwd=str(root),
+        env=env,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+    )
+    stdout, _ = await proc.communicate()
+    output = stdout.decode().strip() if stdout else ""
+    if proc.returncode != 0:
+        log.error(f"Alembic 数据库迁移失败:\n{output}")
+        raise SystemExit(1)
+
+    if "Running upgrade" in output:
+        for line in output.splitlines():
+            if line.strip():
+                log.info(f"[alembic] {line.strip()}")
+
+
+def _port_is_open(host: str, port: int) -> bool:
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(2)
+            return s.connect_ex((host, port)) == 0
+    except OSError:
+        return False
+
+
+async def _ensure_postgres(database_url: str, log) -> None:
+    """Ensure PostgreSQL is reachable. Auto-start a Docker container when
+    the URL points to localhost and the server is not running."""
+    import asyncio
+
+    parsed = urlparse(database_url.replace("postgresql+asyncpg://", "postgresql://"))
+    host = parsed.hostname or "localhost"
+    port = parsed.port or 5432
+
+    if host not in ("localhost", "127.0.0.1"):
+        return
+
+    if _port_is_open(host, port):
+        return
+
+    if not shutil.which("docker"):
+        log.error(
+            "PostgreSQL 不可用且未安装 Docker。\n"
+            "  请安装 Docker: https://docs.docker.com/get-docker/\n"
+            "  或通过 OPENVORT_DATABASE_URL 环境变量指定已有数据库。"
+        )
+        raise SystemExit(1)
+
+    proc = await asyncio.create_subprocess_exec(
+        "docker", "inspect", "--format", "{{.State.Status}}", DOCKER_PG_CONTAINER,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+    )
+    stdout, _ = await proc.communicate()
+    container_status = stdout.decode().strip() if proc.returncode == 0 else ""
+
+    if container_status == "running":
+        return
+    elif container_status:
+        log.info(f"启动已有的 PostgreSQL 容器 ({DOCKER_PG_CONTAINER})...")
+        p = await asyncio.create_subprocess_exec(
+            "docker", "start", DOCKER_PG_CONTAINER,
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await p.communicate()
+        if p.returncode != 0:
+            log.error(f"启动 PostgreSQL 容器失败: {stderr.decode().strip()}")
+            raise SystemExit(1)
+    else:
+        if _port_is_open(host, port):
+            log.error(f"端口 {port} 已被占用但不是 PostgreSQL。请释放端口或配置其他数据库。")
+            raise SystemExit(1)
+        log.info(f"首次启动，正在创建 PostgreSQL 容器 ({DOCKER_PG_IMAGE})...")
+        p = await asyncio.create_subprocess_exec(
+            "docker", "run", "-d",
+            "--name", DOCKER_PG_CONTAINER,
+            "-e", "POSTGRES_USER=openvort",
+            "-e", "POSTGRES_PASSWORD=openvort",
+            "-e", "POSTGRES_DB=openvort",
+            "-p", f"{port}:5432",
+            "-v", f"{DOCKER_PG_VOLUME}:/var/lib/postgresql/data",
+            "--restart", "unless-stopped",
+            DOCKER_PG_IMAGE,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await p.communicate()
+        if p.returncode != 0:
+            log.error(f"创建 PostgreSQL 容器失败: {stderr.decode().strip()}")
+            raise SystemExit(1)
+        log.info("PostgreSQL 容器已创建")
+
+    log.info("等待 PostgreSQL 就绪...")
+    for _ in range(30):
+        if _port_is_open(host, port):
+            log.info("PostgreSQL 已就绪")
+            return
+        await asyncio.sleep(1)
+
+    log.error("PostgreSQL 启动超时（30s），请检查 Docker 容器状态: docker logs openvort-postgres")
+    raise SystemExit(1)
+
+
+async def _ensure_frontend(log) -> None:
+    """Ensure frontend static files exist. Download from GitHub Release if missing."""
+    from openvort.config.settings import get_settings
+
+    settings = get_settings()
+
+    candidates = [Path("/app/web/dist")]
+    project_root = Path(__file__).resolve().parent.parent.parent.parent
+    candidates.append(project_root / "web" / "dist")
+    candidates.append(settings.data_dir / "frontend")
+
+    static_override = os.environ.get("OPENVORT_STATIC_DIR")
+    if static_override:
+        candidates.insert(0, Path(static_override))
+
+    for loc in candidates:
+        if (loc / "index.html").exists():
+            return
+
+    target = settings.data_dir / "frontend"
+    target.mkdir(parents=True, exist_ok=True)
+
+    log.info("前端文件不存在，正在从 GitHub Release 下载...")
+    try:
+        from openvort.core.services.updater import UpdateService
+        updater = UpdateService()
+        release = await updater._find_release(__version__)
+        if not release:
+            log.warning(f"未找到 v{__version__} 的 Release，跳过前端下载。可手动构建: cd web && npm install && npm run build")
+            return
+
+        frontend_asset = None
+        for asset in release.get("assets", []):
+            name = asset["name"]
+            if "frontend" in name and name.endswith(".tar.gz"):
+                frontend_asset = asset
+                break
+
+        if not frontend_asset:
+            log.warning("Release 中未找到前端包，跳过。可手动构建: cd web && npm install && npm run build")
+            return
+
+        import tarfile
+        import tempfile
+
+        tmp_path = Path(tempfile.mktemp(suffix=".tar.gz"))
+        try:
+            log.info(f"下载: {frontend_asset['name']}...")
+            await updater._download_asset(frontend_asset["browser_download_url"], tmp_path)
+
+            with tarfile.open(tmp_path, "r:gz") as tar:
+                members = tar.getmembers()
+                prefix = ""
+                if members and "/" in members[0].name:
+                    prefix = members[0].name.split("/")[0] + "/"
+                target_resolved = target.resolve()
+                for member in members:
+                    if member.name.startswith(prefix):
+                        member.name = member.name[len(prefix):]
+                    if not member.name:
+                        continue
+                    dest = (target / member.name).resolve()
+                    if not str(dest).startswith(str(target_resolved)):
+                        continue
+                    tar.extract(member, target)
+            log.info(f"前端已下载到: {target}")
+        finally:
+            tmp_path.unlink(missing_ok=True)
+    except Exception as e:
+        log.warning(f"前端自动下载失败: {e}")
+        log.warning("可手动构建前端: cd web && npm install && npm run build")
+
+
+@click.command()
+@click.option("--dev", "-d", is_flag=True, help="开发模式：跳过 IM 通道/ASR/TTS 等重量级初始化，加快启动速度")
+def start_cmd(dev: bool):
+    """启动 OpenVort 服务"""
+    _run_async(_start_service(dev=dev))
+
+
+async def _cleanup_duplicate_admins(session_factory):
+    """Remove duplicate 'admin' members created by a historical seed bug."""
+    from sqlalchemy import select, text
+    from openvort.contacts.models import Member
+
+    async with session_factory() as session:
+        stmt = select(Member.id).where(Member.name == "admin").order_by(Member.created_at)
+        rows = (await session.execute(stmt)).all()
+        if len(rows) <= 1:
+            return
+        keep_id = rows[0][0]
+        delete_ids = [r[0] for r in rows[1:]]
+        await session.execute(text("DELETE FROM member_roles WHERE member_id = ANY(:ids)"), {"ids": delete_ids})
+        await session.execute(text("DELETE FROM members WHERE id = ANY(:ids)"), {"ids": delete_ids})
+        await session.commit()
+        from openvort.utils.logging import get_logger
+        get_logger("cli").info(f"已清理 {len(delete_ids)} 条重复 admin 记录")
+
+
+async def _team_im_flow(team_member, msg, build_context, is_group: bool, chat_id: str):
+    """团队行企微 bot 消息流：写入团队队列，流式吐负责人公屏首答。
+
+    企微智能机器人协议只有应答帧没有主动推送，异步的后续进展（成员接力、验收）
+    落在 Web 团队公屏；本流最多等到首答回包。
+    """
+    from openvort.core.engine import team_hub
+    from openvort.core.engine.team_orchestrator import get_team_orchestrator
+    from openvort.core.engine.team_service import strip_team_prefix
+
+    orch = get_team_orchestrator()
+    if not orch:
+        yield {"type": "text", "text": "团队编排服务未启动，请联系管理员。"}
+        return
+
+    ctx = await build_context(msg.channel, msg.sender_id)
+    # 身份：IM 平台身份已绑定的成员优先；否则用 平台:原始id 隔离 lane（群聊按群隔离）
+    if ctx.member and getattr(ctx.member, "id", "") and not getattr(ctx.member, "is_virtual", False):
+        user_key = ctx.member.id
+        sender_name = ctx.member.name
+    else:
+        user_key = f"{msg.channel}:{chat_id or msg.sender_id}"
+        sender_name = getattr(msg, "sender_name", "") or msg.sender_id
+
+    content = (msg.content or "").strip()
+    if is_group:
+        content = f"[{sender_name}]: {content}"
+
+    q = team_hub.subscribe_broadcasts(team_member.id, user_key)
+    try:
+        await orch.submit_user_message(
+            team_member.id, user_key, content, source=msg.channel, sender_name=sender_name)
+    except Exception as e:
+        team_hub.unsubscribe_broadcasts(team_member.id, user_key, q)
+        yield {"type": "text", "text": f"提交给团队失败: {e}"}
+        return
+
+    team_name = strip_team_prefix(team_member.name)
+    ack = f"📨 已收到，已转交「{team_name}」团队处理，负责人马上回应…"
+    first = await team_hub.wait_for_broadcast(team_member.id, user_key, timeout=180.0, q=q)
+    if first:
+        who = first.get("sender_name") or team_name
+        yield {"type": "text", "text": f"{ack}\n\n——\n{who}：{first.get('content', '')}"}
+    else:
+        yield {"type": "text", "text": ack + "\n\n团队仍在处理中，完整进展请到 OpenVort 网页端团队公屏查看。"}
+
+
+async def _start_service(*, dev: bool = False):
+    """启动服务的异步实现"""
+    from openvort.auth.service import AuthService
+    from openvort.config.settings import get_settings
+    from openvort.contacts.plugin import ContactsPlugin
+    from openvort.contacts.resolver import IdentityResolver
+    from openvort.core.engine.agent import AgentRuntime
+    from openvort.core.engine.context import RequestContext
+    from openvort.core.engine.session import SessionStore
+    from openvort.db import init_db
+    from openvort.db.engine import get_session_factory
+    from openvort.plugin import PluginLoader, PluginRegistry
+    from openvort.utils.logging import setup_logging
+
+    settings = get_settings()
+    setup_logging(settings.log_level)
+
+    from openvort.utils.logging import get_logger
+    log = get_logger("cli")
+
+    log.info(f"OpenVort v{__version__} 启动中..." + (" [DEV]" if dev else ""))
+
+    # 单例保护：杀掉旧进程，写入当前 PID
+    _check_and_kill_existing()
+    log.info(f"PID={os.getpid()}, PID 文件: {PID_FILE}")
+
+    # 自动确保 PostgreSQL 可用（localhost 场景下自动拉起 Docker 容器）
+    await _ensure_postgres(settings.database_url, log)
+
+    # 初始化数据库
+    await init_db(settings.database_url)
+
+    # Alembic schema 迁移（baseline 之后的增量）
+    await _run_alembic_upgrade(settings.database_url, log)
+
+    session_factory = get_session_factory()
+
+    # 清理可能由历史 bug 产生的重复 admin 记录
+    await _cleanup_duplicate_admins(session_factory)
+
+    # 初始化权限服务
+    auth_service = AuthService(session_factory)
+    await auth_service.init_builtin()
+
+    # ---- 首次启动：自动创建管理员 ----
+    from openvort.core.setup import is_initialized
+
+    is_first_boot = not await is_initialized(session_factory)
+    if is_first_boot:
+        log.info("检测到首次启动，自动创建管理员...")
+        await _auto_create_admin(session_factory, auth_service)
+
+    # 加载 AI 人设（如果存在）
+    identity_prompt = ""
+    identity_file = Path("data/identity.md")
+    if identity_file.exists():
+        identity_prompt = identity_file.read_text(encoding="utf-8")
+        log.info("已加载 AI 人设配置")
+
+    # 初始化插件系统
+    registry = PluginRegistry()
+    loader = PluginLoader(registry, auth_service=auth_service)
+    loader.load_all()
+    await loader.load_all_async()
+
+    # Initialize remote work node service and register executors
+    try:
+        from openvort.core.execution.remote_node import RemoteNodeService
+        from openvort.core.execution.remote_executor import register_executor
+        from openvort.core.execution.docker_executor import DockerExecutor
+        from openvort.core.execution.node_tools import set_node_tools_runtime
+        register_executor("docker", DockerExecutor())
+        remote_node_service = RemoteNodeService(session_factory)
+        set_node_tools_runtime(remote_node_service, session_factory)
+    except Exception as e:
+        log.warning(f"远程工作节点服务初始化失败: {e}")
+
+    # Initialize TaskRunner for async agent execution
+    try:
+        from openvort.core.task_runner import init_task_runner
+        task_runner = init_task_runner(session_factory)
+        await task_runner.recover_on_startup()
+        log.info("AgentTaskRunner 已初始化")
+    except Exception as e:
+        log.warning(f"TaskRunner 初始化失败: {e}")
+
+    # Initialize NotificationCenter for delayed IM delivery
+    # NotificationCenter 仅依赖 channel_registry 调 ch.send()，并不依赖 channel.start()
+    # 拉起的长连接，因此在 dev 模式下也允许初始化，方便本地测试 VortFlow IM 通知。
+    # 区别仅在于：dev 模式下不做 recover_on_startup（避免把生产堆积的 pending 任务也跑一遍）。
+    try:
+        from openvort.core.services.notification import init_notification_center
+        notif_center = init_notification_center(session_factory, registry)
+        if not dev:
+            await notif_center.recover_on_startup()
+        log.info("NotificationCenter 已初始化" + (" [DEV: skip recover]" if dev else ""))
+    except Exception as e:
+        log.warning(f"NotificationCenter 初始化失败: {e}")
+
+    # 加载 Skill（知识注入，DB 驱动）
+    from openvort.skill.loader import SkillLoader
+    skill_loader = SkillLoader(registry)
+    await skill_loader.load_all(session_factory)
+
+    # 注入 AuthService 到 ContactsPlugin
+    for plugin in loader.get_plugins():
+        if isinstance(plugin, ContactsPlugin):
+            plugin.set_auth_service(auth_service)
+
+    # 初始化身份解析器
+    resolver = IdentityResolver(session_factory)
+
+    # 从 DB 加载配置覆盖（优先级：DB > .env > 默认值）
+    from openvort.config.config_service import ConfigService
+    config_service = ConfigService(session_factory)
+    await config_service.load_all()
+    await config_service.apply_llm_to_settings()
+    await config_service.apply_org_to_settings()
+    await config_service.apply_web_to_settings()
+
+    # 初始化 Agent
+    session_store = SessionStore(session_factory=session_factory)
+    agent = AgentRuntime(settings.llm, registry, session_store)
+
+    # 初始化 IM 命令处理器
+    from openvort.core.messaging.commands import CommandHandler
+    command_handler = CommandHandler(
+        session_store=session_store,
+        llm_client=agent._llm,
+        model_name=settings.llm.model,
+    )
+
+    # 注入 AI 人设到 system prompt
+    if identity_prompt:
+        agent._system_prompt += f"\n\n# AI 身份\n\n{identity_prompt}"
+
+    # 初始化 AI 团队编排器（响应队列 worker；重启回收孤儿项、pending 续跑）
+    try:
+        from openvort.core.engine.team_orchestrator import init_team_orchestrator
+        team_orchestrator = init_team_orchestrator(session_factory, agent._llm, registry)
+        await team_orchestrator.start()
+    except Exception as e:
+        log.warning(f"TeamOrchestrator 初始化失败: {e}")
+
+    # 构建 RequestContext 的辅助函数
+    async def build_context(channel_name: str, user_id: str) -> RequestContext:
+        ctx = RequestContext(channel=channel_name, user_id=user_id)
+
+        # 注入身份刷新回调（同步/绑定后可重新解析身份）
+        async def _refresh_identity(ctx: RequestContext) -> None:
+            resolver.invalidate(ctx.channel, ctx.user_id)
+            member = await resolver.resolve(ctx.channel, ctx.user_id)
+            if member:
+                ctx.member = member
+                ctx.roles = await auth_service.get_member_roles(member.id)
+                ctx.permissions = await auth_service.get_member_permissions(member.id)
+                ctx.platform_accounts.clear()
+                from sqlalchemy import select
+                from openvort.contacts.models import PlatformIdentity
+                async with session_factory() as session:
+                    stmt = select(PlatformIdentity.platform, PlatformIdentity.platform_user_id).where(
+                        PlatformIdentity.member_id == member.id,
+                    )
+                    result = await session.execute(stmt)
+                    for row in result.all():
+                        ctx.platform_accounts[row[0]] = row[1]
+
+        ctx._identity_refresher = _refresh_identity
+
+        # 解析身份
+        try:
+            member = None
+            if channel_name == "web":
+                # Web 通道的 user_id 就是 member_id，直接按 ID 查
+                from sqlalchemy import select as _select
+                from openvort.contacts.models import Member as _Member
+                async with session_factory() as _sess:
+                    _result = await _sess.execute(_select(_Member).where(_Member.id == user_id))
+                    member = _result.scalar_one_or_none()
+            else:
+                member = await resolver.resolve(channel_name, user_id)
+            if member:
+                ctx.member = member
+                ctx.roles = await auth_service.get_member_roles(member.id)
+                ctx.permissions = await auth_service.get_member_permissions(member.id)
+                # 查职位
+                from sqlalchemy import select
+
+                from openvort.contacts.models import PlatformIdentity
+                async with session_factory() as session:
+                    stmt = select(PlatformIdentity.platform_position).where(
+                        PlatformIdentity.platform == channel_name,
+                        PlatformIdentity.platform_user_id == user_id,
+                    )
+                    result = await session.execute(stmt)
+                    pos = result.scalar_one_or_none()
+                    if pos:
+                        ctx.position = pos
+
+                    # 查各平台账号映射
+                    stmt2 = select(PlatformIdentity.platform, PlatformIdentity.platform_user_id).where(
+                        PlatformIdentity.member_id == member.id,
+                    )
+                    result2 = await session.execute(stmt2)
+                    for row in result2.all():
+                        ctx.platform_accounts[row[0]] = row[1]
+        except Exception as e:
+            log.warning(f"构建上下文失败: {e}")
+
+        # 渠道 prompt
+        ch = registry.get_channel(channel_name)
+        if ch:
+            ctx.channel_prompt = ch.get_channel_prompt()
+            ctx.allowed_tools = ch.get_tool_filter()
+            ctx.max_reply_length = ch.get_max_reply_length()
+
+        return ctx
+
+    # 初始化消息调度器
+    from openvort.core.messaging.dispatcher import MessageDispatcher
+    dispatcher = MessageDispatcher()
+
+    # 初始化 ASR / TTS / Embedding 服务（dev 模式下跳过）
+    asr_service = None
+    tts_service = None
+    embedding_service = None
+    if not dev:
+        from openvort.services.asr import ASRService
+        asr_service = ASRService(session_factory)
+        await asr_service.load_providers()
+
+        from openvort.services.tts import TTSService
+        tts_service = TTSService(session_factory)
+        await tts_service.load_providers()
+
+        from openvort.services.embedding import EmbeddingService
+        embedding_service = EmbeddingService(session_factory)
+        await embedding_service.load_providers()
+
+        voice_tool = registry.get_tool("wecom_send_voice")
+        if voice_tool and hasattr(voice_tool, "set_tts_service"):
+            voice_tool.set_tts_service(tts_service)
+        feishu_voice_tool = registry.get_tool("feishu_send_voice")
+        if feishu_voice_tool and hasattr(feishu_voice_tool, "set_tts_service"):
+            feishu_voice_tool.set_tts_service(tts_service)
+        dingtalk_voice_tool = registry.get_tool("dingtalk_send_voice")
+        if dingtalk_voice_tool and hasattr(dingtalk_voice_tool, "set_tts_service"):
+            dingtalk_voice_tool.set_tts_service(tts_service)
+
+    # 初始化 InboxService（IM 跨实例消息去重）
+    from openvort.core.messaging.inbox import InboxService
+    inbox_service = InboxService(session_factory)
+
+    # 配置 Channel（dev 模式下跳过 IM 通道启动）
+    import asyncio
+
+    _employee_bot_mgr = None
+    channels = registry.list_channels() if not dev else []
+    for ch in channels:
+        if hasattr(ch, "set_inbox_service"):
+            ch.set_inbox_service(inbox_service)
+    for ch in channels:
+        if ch.name == "wecom" and ch.is_configured():
+            _ch = ch  # 闭包捕获
+            if hasattr(_ch, "set_asr_service"):
+                _ch.set_asr_service(asr_service)
+
+            async def handle_message(msg):
+                # IM 命令拦截（/new /status /compact /think /usage /help）
+                cmd_result = await command_handler.handle(msg.channel, msg.sender_id, msg.content)
+                if cmd_result.handled:
+                    if cmd_result.reply:
+                        from openvort.plugin.base import Message as Msg
+                        await _ch.send(msg.sender_id, Msg(content=cmd_result.reply, channel="wecom"))
+                    return None
+
+                ctx = await build_context(msg.channel, msg.sender_id)
+                ctx.images = getattr(msg, "images", []) or []
+
+                async def process_fn(ctx_, content_):
+                    return await agent.process(ctx_, content_)
+
+                async def send_fn(reply_):
+                    log.info(f"回复: {reply_[:50]}")
+                    from openvort.plugin.base import Message as Msg
+                    await _ch.send(msg.sender_id, Msg(content=reply_, channel="wecom"))
+
+                # dispatcher 返回 None 表示消息已入队，不需要回复
+                reply = await dispatcher.dispatch(ctx, msg.content, process_fn, send_fn)
+                return reply
+
+            ch.on_message(handle_message)
+
+            # Bot mode runs alongside other modes (separate message source)
+            bot_disabled = os.getenv("OPENVORT_WECOM_BOT_DISABLED", "").lower() in ("1", "true", "yes")
+            if bot_disabled:
+                log.info("OPENVORT_WECOM_BOT_DISABLED 已设置，跳过企微 Bot 消费模式")
+            elif ch.is_bot_configured():
+                async def bot_stream_handler(msg):
+                    # Determine session scope: group chats use chat_id
+                    raw = getattr(msg, "raw", None) or {}
+                    chat_type = raw.get("_bot_chat_type", "single")
+                    chat_id = raw.get("_bot_chat_id", "")
+                    is_group = chat_type != "single" and bool(chat_id)
+                    session_uid = f"group:{chat_id}" if is_group else msg.sender_id
+
+                    cmd_result = await command_handler.handle(msg.channel, session_uid, msg.content)
+                    if cmd_result.handled:
+                        if cmd_result.reply:
+                            yield {"type": "text", "text": cmd_result.reply}
+                        return
+
+                    ctx = await build_context(msg.channel, msg.sender_id)
+                    ctx.images = getattr(msg, "images", []) or []
+
+                    content = msg.content
+                    if is_group:
+                        ctx.user_id = session_uid
+                        ctx.group_id = chat_id
+                        sender_name = ctx.member.name if ctx.member else msg.sender_id
+                        content = f"[{sender_name}]: {content}"
+
+                        try:
+                            from openvort.core.messaging.group_context import group_context_manager as gcm
+                            await gcm.get_or_create(chat_id, msg.channel)
+                            ctx.group_prompt = await gcm.build_group_prompt(chat_id)
+                        except Exception as e:
+                            log.warning(f"群聊上下文加载失败: {e}")
+
+                    async for event in agent.process_stream_im(ctx, content):
+                        yield event
+
+                _ch.set_stream_handler(bot_stream_handler)
+                await ch.start_bot()
+
+            # ---- AI Employee independent bots ----
+            try:
+                from openvort.channels.wecom.employee_bot import EmployeeBotManager
+
+                _employee_bot_mgr = EmployeeBotManager()
+
+                def _make_employee_stream_handler(emp_member_id: str):
+                    async def handler(msg):
+                        raw = getattr(msg, "raw", None) or {}
+                        chat_type = raw.get("_bot_chat_type", "single")
+                        chat_id = raw.get("_bot_chat_id", "")
+                        is_group = chat_type != "single" and bool(chat_id)
+
+                        # 团队行 bot：消息进团队响应队列，流式吐负责人首答
+                        try:
+                            from openvort.contacts.models import Member as _M
+                            from openvort.core.engine.team_service import is_team_row
+                            async with session_factory() as _db:
+                                _target = await _db.get(_M, emp_member_id)
+                            if is_team_row(_target):
+                                async for ev in _team_im_flow(
+                                    _target, msg, build_context, is_group, chat_id,
+                                ):
+                                    yield ev
+                                return
+                        except Exception as e:
+                            log.warning(f"团队 IM 分支判断失败，回落普通链路: {e}")
+
+                        if is_group:
+                            session_uid = f"group:emp:{emp_member_id}:{chat_id}"
+                        else:
+                            session_uid = f"emp:{emp_member_id}:{msg.sender_id}"
+
+                        cmd_result = await command_handler.handle(msg.channel, session_uid, msg.content)
+                        if cmd_result.handled:
+                            if cmd_result.reply:
+                                yield {"type": "text", "text": cmd_result.reply}
+                            return
+
+                        ctx = await build_context(msg.channel, msg.sender_id)
+                        ctx.user_id = session_uid
+                        ctx.target_member_id = emp_member_id
+                        ctx.images = getattr(msg, "images", []) or []
+
+                        content = msg.content
+                        if is_group:
+                            ctx.group_id = chat_id
+                            sender_name = ctx.member.name if ctx.member else msg.sender_id
+                            content = f"[{sender_name}]: {content}"
+
+                        async for event in agent.process_stream_im(ctx, content):
+                            yield event
+                    return handler
+
+                count = await _employee_bot_mgr.start_all(
+                    session_factory,
+                    _make_employee_stream_handler,
+                    inbox=inbox_service,
+                )
+                if count:
+                    log.info(f"企微 AI 员工独立 Bot: 已启动 {count} 个")
+            except Exception as e:
+                log.warning(f"启动 AI 员工独立 Bot 失败: {e}")
+
+            await ch.start()
+
+        # ---- OpenClaw Channel ----
+        if ch.name == "openclaw" and ch.is_configured():
+            _oc_ch = ch
+
+            async def handle_openclaw_message(msg):
+                cmd_result = await command_handler.handle(msg.channel, msg.sender_id, msg.content)
+                if cmd_result.handled:
+                    if cmd_result.reply:
+                        from openvort.plugin.base import Message as Msg
+                        await _oc_ch.send(msg.sender_id, Msg(content=cmd_result.reply, channel="openclaw"))
+                    return None
+
+                ctx = await build_context(msg.channel, msg.sender_id)
+                ctx.images = getattr(msg, "images", []) or []
+
+                async def process_fn(ctx_, content_):
+                    return await agent.process(ctx_, content_)
+
+                async def send_fn(reply_):
+                    log.info(f"OpenClaw 回复: {reply_[:50]}")
+                    from openvort.plugin.base import Message as Msg
+                    await _oc_ch.send(msg.sender_id, Msg(content=reply_, channel="openclaw"))
+
+                reply = await dispatcher.dispatch(ctx, msg.content, process_fn, send_fn)
+                return reply
+
+            ch.on_message(handle_openclaw_message)
+            await ch.start()
+
+        # ---- DingTalk Channel (Stream mode) ----
+        if ch.name == "dingtalk" and ch.is_configured():
+            from openvort.channels.dingtalk.channel import DingTalkChannel as _DingTalkCh
+            _dt_ch: _DingTalkCh = ch  # type: ignore[assignment]
+
+            async def dingtalk_stream_handler(msg):
+                cmd_result = await command_handler.handle(msg.channel, msg.sender_id, msg.content)
+                if cmd_result.handled:
+                    if cmd_result.reply:
+                        yield {"type": "text", "text": cmd_result.reply}
+                    return
+
+                ctx = await build_context(msg.channel, msg.sender_id)
+                ctx.images = getattr(msg, "images", []) or []
+
+                async for event in agent.process_stream_im(ctx, msg.content):
+                    yield event
+
+            async def handle_dingtalk_message(msg):
+                cmd_result = await command_handler.handle(msg.channel, msg.sender_id, msg.content)
+                if cmd_result.handled:
+                    return cmd_result.reply
+
+                ctx = await build_context(msg.channel, msg.sender_id)
+                ctx.images = getattr(msg, "images", []) or []
+
+                async def process_fn(ctx_, content_):
+                    return await agent.process(ctx_, content_)
+
+                async def send_fn(reply_):
+                    log.info(f"钉钉回复: {reply_[:50]}")
+                    from openvort.plugin.base import Message as Msg
+                    await _dt_ch.send(msg.sender_id, Msg(content=reply_, channel="dingtalk", raw=msg.raw))
+
+                reply = await dispatcher.dispatch(ctx, msg.content, process_fn, send_fn)
+                return reply
+
+            _dt_ch.set_stream_handler(dingtalk_stream_handler)
+            _dt_ch.on_message(handle_dingtalk_message)
+
+            if _dt_ch.is_stream_configured():
+                await _dt_ch.start_stream()
+            else:
+                await _dt_ch.start()
+
+        # ---- Feishu Channel (WebSocket mode) ----
+        if ch.name == "feishu" and ch.is_configured():
+            from openvort.channels.feishu.channel import FeishuChannel as _FeishuCh
+            _fs_ch: _FeishuCh = ch  # type: ignore[assignment]
+            if hasattr(_fs_ch, "set_asr_service"):
+                _fs_ch.set_asr_service(asr_service)
+
+            async def feishu_stream_handler(msg):
+                cmd_result = await command_handler.handle(msg.channel, msg.sender_id, msg.content)
+                if cmd_result.handled:
+                    if cmd_result.reply:
+                        yield {"type": "text", "text": cmd_result.reply}
+                    return
+
+                ctx = await build_context(msg.channel, msg.sender_id)
+                ctx.images = getattr(msg, "images", []) or []
+
+                async for event in agent.process_stream_im(ctx, msg.content):
+                    yield event
+
+            async def handle_feishu_message(msg):
+                cmd_result = await command_handler.handle(msg.channel, msg.sender_id, msg.content)
+                if cmd_result.handled:
+                    return cmd_result.reply
+
+                ctx = await build_context(msg.channel, msg.sender_id)
+                ctx.images = getattr(msg, "images", []) or []
+
+                async def process_fn(ctx_, content_):
+                    return await agent.process(ctx_, content_)
+
+                async def send_fn(reply_):
+                    log.info(f"飞书回复: {reply_[:50]}")
+                    from openvort.plugin.base import Message as Msg
+                    await _fs_ch.send(msg.sender_id, Msg(content=reply_, channel="feishu", raw=msg.raw))
+
+                reply = await dispatcher.dispatch(ctx, msg.content, process_fn, send_fn)
+                return reply
+
+            _fs_ch.set_stream_handler(feishu_stream_handler)
+            _fs_ch.on_message(handle_feishu_message)
+
+            if _fs_ch.is_ws_configured():
+                await _fs_ch.start_ws()
+            else:
+                await _fs_ch.start()
+
+    # Determine wecom mode(s) for logging
+    _modes = []
+    _wecom_ch = registry.get_channel("wecom")
+    if _wecom_ch and hasattr(_wecom_ch, "_bot_mode") and _wecom_ch._bot_mode:
+        _modes.append("bot")
+    _modes.append("webhook")
+    mode = "+".join(_modes)
+    log.debug(f"已加载 {len(channels)} 个 Channel, {len(registry.list_tools())} 个 Tool (模式: {mode})")
+
+    # ---- 定时任务调度器 ----
+    from openvort.core.services.scheduler import Scheduler as _Scheduler
+    from openvort.core.services.schedule_service import ScheduleService as _ScheduleService
+
+    async def _schedule_notify(
+        owner_id: str,
+        job_name: str,
+        result_text: str,
+        executor_member=None,
+        job_id: str = "",
+        status: str = "success",
+        tool_messages: dict | None = None,
+    ):
+        """Push scheduled task result to the job owner via WebSocket and IM channels."""
+        from openvort.plugin.base import Message as _Msg
+
+        # 确定执行人名称和身份
+        executor_name = "系统助手"
+        is_ai_employee = False
+        if executor_member and hasattr(executor_member, "is_virtual") and executor_member.is_virtual:
+            executor_name = executor_member.name or "AI 员工"
+            is_ai_employee = True
+
+        # 构建消息前缀
+        if is_ai_employee:
+            prefix = f"【AI 员工·{executor_name}】已完成任务「{job_name}」\n\n"
+        else:
+            prefix = f"【定时任务】已完成任务「{job_name}」\n\n"
+
+        full_message = prefix + result_text[:3000]  # 限制总长度
+
+        # 0. Persist to chat_messages + bump unread_count
+        target_session_id = ""
+        try:
+            from openvort.core.services.chat_message import write_chat_message
+            from sqlalchemy import select as _sel
+            from openvort.db.models import ChatSession
+
+            if is_ai_employee and executor_member:
+                async with session_factory() as _s:
+                    stmt = _sel(ChatSession).where(
+                        ChatSession.user_id == owner_id,
+                        ChatSession.channel == "web",
+                        ChatSession.target_type == "member",
+                        ChatSession.target_id == executor_member.id,
+                        ChatSession.hidden == False,  # noqa: E712
+                    )
+                    session_obj = (await _s.execute(stmt)).scalar_one_or_none()
+                    if not session_obj:
+                        # Auto-create session for this AI employee
+                        session_obj = ChatSession(
+                            channel="web",
+                            user_id=owner_id,
+                            session_id=__import__("uuid").uuid4().hex[:8],
+                            title=executor_member.name or "AI 员工",
+                            messages="[]",
+                            target_type="member",
+                            target_id=executor_member.id,
+                        )
+                        _s.add(session_obj)
+                        await _s.flush()
+
+                    target_session_id = session_obj.session_id
+
+                    # Build metadata_json with tool_calls for screenshot persistence
+                    meta = {}
+                    if tool_messages and tool_messages.get("tool_uses"):
+                        result_map: dict[str, str] = {}
+                        for tr in tool_messages.get("tool_results", []):
+                            result_map[tr.get("tool_use_id", "")] = tr.get("content", "")
+                        meta["tool_calls"] = [
+                            {
+                                "name": tu.get("name", ""),
+                                "id": tu.get("id", ""),
+                                "status": "done",
+                                "output": result_map.get(tu.get("id", ""), ""),
+                            }
+                            for tu in tool_messages["tool_uses"]
+                        ]
+
+                    await write_chat_message(
+                        _s,
+                        session_id=target_session_id,
+                        owner_id=owner_id,
+                        sender_type="assistant",
+                        sender_id=executor_member.id,
+                        content=full_message,
+                        metadata_json=__import__("json").dumps(meta, ensure_ascii=False) if meta else "{}",
+                        source="schedule",
+                        is_read=False,
+                        increment_unread=True,
+                    )
+                    await _s.commit()
+        except Exception as e:
+            log.warning(f"Failed to persist schedule result to chat_messages: {e}")
+
+        # 0.5 Inject into SessionStore so the message persists in chat history
+        if target_session_id and is_ai_employee:
+            try:
+                msgs = await session_store.get_messages("web", owner_id, target_session_id)
+                if tool_messages and tool_messages.get("tool_uses"):
+                    # Inject structured assistant message (tool_use blocks + text)
+                    # so /chat/history can parse tool_calls and screenshots
+                    content_blocks = list(tool_messages["tool_uses"])
+                    content_blocks.append({"type": "text", "text": full_message})
+                    msgs.append({"role": "assistant", "content": content_blocks})
+                    if tool_messages.get("tool_results"):
+                        msgs.append({"role": "user", "content": list(tool_messages["tool_results"])})
+                else:
+                    msgs.append({"role": "assistant", "content": full_message})
+                await session_store.save_messages("web", owner_id, msgs, target_session_id)
+            except Exception as e:
+                log.debug(f"注入 SessionStore 失败: {e}")
+
+        # 1. WebSocket push (web UI)
+        try:
+            from openvort.web.ws import manager as ws_manager
+
+            severity = "error" if status == "failed" else "info"
+            actions = [
+                {"label": "重新执行", "action": "rerun", "job_id": job_id},
+                {"label": "查看详情", "action": "view_detail", "job_id": job_id},
+            ] if job_id else []
+
+            await ws_manager.send_to(owner_id, {
+                "type": "schedule_result",
+                "job_id": job_id,
+                "job_name": job_name,
+                "result": result_text[:2000],
+                "executor_name": executor_name,
+                "is_ai_employee": is_ai_employee,
+                "severity": severity,
+                "actions": actions,
+            })
+
+            if is_ai_employee and executor_member and target_session_id:
+                await ws_manager.send_to(owner_id, {
+                    "type": "message",
+                    "session_id": target_session_id,
+                    "sender_type": "member",
+                    "sender_id": executor_member.id,
+                    "sender_name": executor_name,
+                    "content": full_message,
+                    "from_schedule": True,
+                    "job_id": job_id,
+                    "job_name": job_name,
+                })
+                from openvort.core.services.chat_message import push_unread_update
+                await push_unread_update(owner_id, target_session_id)
+        except Exception as e:
+            log.debug(f"WebSocket 推送失败（用户可能不在线）: {e}")
+
+        # 2. Delayed IM notification via NotificationCenter
+        try:
+            from openvort.core.services.notification import get_notification_center
+            nc = get_notification_center()
+            if nc:
+                await nc.schedule_notify(
+                    recipient_id=owner_id,
+                    source="schedule",
+                    source_id=job_id,
+                    session_id=target_session_id,
+                    title=f"{executor_name} {'完成' if status == 'success' else '执行失败'}了「{job_name}」",
+                    summary=result_text[:300],
+                    severity="error" if status == "failed" else "info",
+                )
+        except Exception as e:
+            log.warning(f"NotificationCenter 调度失败: {e}")
+
+    _scheduler = _Scheduler()
+    _scheduler.start()
+
+    # im_inbox periodic cleanup (every hour, delete entries older than 24h)
+    async def _im_inbox_cleanup():
+        await inbox_service.cleanup(max_age_hours=24)
+    _scheduler.add_interval("im_inbox_cleanup", _im_inbox_cleanup, seconds=3600)
+
+    schedule_service = _ScheduleService(session_factory, _scheduler, agent, notify_fn=_schedule_notify)
+    try:
+        count = await schedule_service.sync_to_scheduler()
+        if count:
+            log.info(f"已恢复 {count} 个定时任务")
+    except Exception as e:
+        log.warning(f"恢复定时任务失败: {e}")
+
+    # ---- 确保前端静态文件存在 ----
+    await _ensure_frontend(log)
+
+    # ---- Web 管理面板 ----
+    web_server = None
+    web_started = False
+    if settings.web.enabled:
+        try:
+            import uvicorn
+            from openvort.web.app import create_app
+            from openvort.web.deps import set_runtime
+            from openvort.web.routers.logs import install_log_handler
+
+            # 初始化 MarketplaceInstaller（如果启用）
+            marketplace_installer = None
+            if settings.marketplace.enabled:
+                from openvort.marketplace import MarketplaceClient, MarketplaceInstaller
+                mkt_client = MarketplaceClient()
+                marketplace_installer = MarketplaceInstaller(mkt_client, session_factory, registry, data_dir=settings.data_dir)
+
+            # 注入运行时依赖
+            set_runtime(agent, registry, session_store, session_factory,
+                        auth_service=auth_service, build_context_fn=build_context,
+                        skill_loader=skill_loader, config_service=config_service,
+                        schedule_service=schedule_service,
+                        embedding_service=embedding_service,
+                        asr_service=asr_service,
+                        tts_service=tts_service,
+                        marketplace_installer=marketplace_installer)
+            install_log_handler()
+
+            web_app = create_app()
+            try:
+                _feishu_ch = registry.get_channel("feishu")
+                if _feishu_ch and _feishu_ch.is_configured():
+                    from openvort.channels.feishu.callback import create_feishu_callback_router
+
+                    web_app.include_router(create_feishu_callback_router(_feishu_ch), tags=["feishu-callback"])
+                    log.info("已挂载飞书回调路由: /callback/feishu")
+            except Exception as e:
+                log.warning(f"挂载飞书回调路由失败: {e}")
+
+            config = uvicorn.Config(
+                web_app,
+                host=settings.web.host,
+                port=settings.web.port,
+                log_level="warning",
+            )
+            web_server = uvicorn.Server(config)
+
+            async def _run_web_server():
+                try:
+                    await web_server.serve()
+                except SystemExit:
+                    pass
+                except Exception as e:
+                    log.warning(f"Web 面板运行异常: {e}")
+
+            asyncio.create_task(_run_web_server())
+            web_started = True
+        except ImportError as ie:
+            log.warning(f"未安装 uvicorn/fastapi，Web 面板未启动。运行 pip install uvicorn fastapi 安装。ImportError: {ie}")
+        except Exception as e:
+            log.warning(f"Web 面板启动失败: {e}")
+
+    _print_ready_banner(settings, settings.web.enabled and web_started, is_first_boot, channels, registry, dev=dev)
+
+    # 保持运行
+    try:
+        while True:
+            await asyncio.sleep(1)
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        log.info("正在关闭...")
+        _scheduler.stop()
+        try:
+            if _employee_bot_mgr:
+                await _employee_bot_mgr.stop_all()
+        except Exception:
+            pass
+        for ch in channels:
+            await ch.stop()
+        from openvort.db import close_db
+        await close_db()
+        _cleanup_pid()
+        log.info("已退出")
+
+
+@click.command()
+def stop_cmd():
+    """停止 OpenVort 服务"""
+    if not PID_FILE.exists():
+        click.echo("未发现运行中的 OpenVort 进程（PID 文件不存在）")
+        return
+
+    try:
+        pid = int(PID_FILE.read_text().strip())
+    except (ValueError, OSError):
+        click.echo("PID 文件损坏，已清理")
+        PID_FILE.unlink(missing_ok=True)
+        return
+
+    if not _is_process_alive(pid):
+        click.echo(f"进程 {pid} 已不存在，清理 PID 文件")
+        PID_FILE.unlink(missing_ok=True)
+        return
+
+    click.echo(f"正在停止 OpenVort (PID={pid}) ...")
+    killed = _graceful_kill(pid)
+    if killed:
+        PID_FILE.unlink(missing_ok=True)
+        click.echo("已停止")
+    else:
+        click.echo(f"警告: 进程 {pid} 未能完全退出，请手动 kill -9 {pid}")
+
+
+@click.command()
+@click.option("--dev", "-d", is_flag=True, help="开发模式：跳过 IM 通道/ASR/TTS 等重量级初始化，加快启动速度")
+def restart_cmd(dev: bool):
+    """重启 OpenVort 服务（stop + start）"""
+    if PID_FILE.exists():
+        try:
+            pid = int(PID_FILE.read_text().strip())
+            if _is_process_alive(pid):
+                click.echo(f"正在停止旧进程 (PID={pid}) ...")
+                killed = _graceful_kill(pid)
+                if killed:
+                    PID_FILE.unlink(missing_ok=True)
+                    click.echo("旧进程已停止")
+                else:
+                    click.echo(f"警告: 旧进程 {pid} 未能退出，尝试强制启动...")
+        except (ValueError, OSError):
+            pass
+
+    click.echo("正在启动...")
+    _run_async(_start_service(dev=dev))
+
+
+async def _auto_create_admin(session_factory, auth_service):
+    """首次启动时自动创建管理员账号"""
+    from openvort.contacts.models import Member
+    from openvort.web.auth import hash_password
+    from openvort.config.settings import get_settings
+    from openvort.core.setup import mark_initialized
+
+    settings = get_settings()
+
+    async with session_factory() as session:
+        member = Member(
+            name="admin",
+            status="active",
+            is_account=True,
+            password_hash=hash_password(settings.web.default_password),
+            must_change_password=True,
+        )
+        session.add(member)
+        await session.flush()
+        member_id = member.id
+        await session.commit()
+
+    await auth_service.assign_role(member_id, "admin")
+    await mark_initialized(session_factory, member_id)
+
+
+def _print_ready_banner(settings, web_ok: bool, first_boot: bool, channels, registry, *, dev: bool = False):
+    """Print the startup-complete banner to stdout."""
+    from openvort.config.settings import get_settings
+    settings = get_settings()
+
+    host = settings.web.host
+    port = settings.web.port
+    display_host = "localhost" if host == "0.0.0.0" else host
+
+    if dev:
+        backend_url = f"http://{display_host}:{port}"
+        panel_url = backend_url
+    else:
+        site_url = settings.web.site_url.rstrip("/") if settings.web.site_url else ""
+        if site_url:
+            panel_url = site_url
+        else:
+            panel_url = f"http://{display_host}:{port}"
+
+    tool_count = len(registry.list_tools())
+    ch_count = len(channels)
+
+    w = 52
+    border = "=" * w
+
+    lines: list[str] = []
+    lines.append("")
+    lines.append(border)
+    title = f"  OpenVort v{__version__} started"
+    if dev:
+        title += " [DEV]"
+    lines.append(title.center(w))
+    lines.append(border)
+    lines.append("")
+
+    if web_ok:
+        if dev:
+            lines.append(f"  Backend {panel_url}")
+            lines.append(f"  API     {panel_url}/api")
+        else:
+            lines.append(f"  Panel   {panel_url}")
+            lines.append(f"  API     {panel_url}/api")
+    else:
+        lines.append("  Panel   (disabled)")
+
+    lines.append("")
+    lines.append(f"  Channels  {ch_count}      Tools  {tool_count}")
+
+    if dev:
+        lines.append("")
+        lines.append("  Mode    DEV (IM channels / ASR / TTS skipped)")
+        lines.append(f"  Tip     Run 'cd web && npm run dev' for frontend HMR")
+
+    lines.append("")
+
+    if first_boot:
+        default_pwd = settings.web.default_password
+        lines.append("  *** First boot — admin account created ***")
+        lines.append(f"  Username: admin")
+        lines.append(f"  Password: {default_pwd}")
+        lines.append("")
+
+    lines.append(border)
+    lines.append("")
+
+    click.echo("\n".join(lines))
